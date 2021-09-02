@@ -40,6 +40,7 @@ import com.intellij.openapi.util.io.FileUtil;
 import com.intellij.openapi.util.registry.Registry;
 import com.intellij.openapi.util.text.StringUtil;
 import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiFile;
 import com.intellij.psi.search.SearchScope;
 import com.intellij.util.Consumer;
@@ -158,6 +159,11 @@ public final class DartAnalysisServerService implements Disposable {
 
   private boolean myDisposed;
   private final @NotNull Condition<?> myDisposedCondition = o -> myDisposed;
+  private boolean myPendingSuggestions = false;
+  private String myCompletionId;
+  private int myLastOffsetInParent = -1;
+  public CompletionInfo lastCompletions;
+  public CompletionInfo defaultCompletions;
 
   public static String getClientId() {
     return ApplicationNamesInfo.getInstance().getFullProductName().replace(' ', '-');
@@ -279,10 +285,19 @@ public final class DartAnalysisServerService implements Disposable {
                                    @NotNull final List<IncludedSuggestionRelevanceTag> includedSuggestionRelevanceTags,
                                    final boolean isLast,
                                    @Nullable final String libraryFilePathSD) {
-      synchronized (myCompletionInfos) {
-        myCompletionInfos.add(new CompletionInfo(completionId, replacementOffset, replacementLength, completions, includedSuggestionSets,
-                                                 includedElementKinds, includedSuggestionRelevanceTags, isLast, libraryFilePathSD));
-        myCompletionInfos.notifyAll();
+      CompletionInfo completionInfo =
+        new CompletionInfo(completionId, replacementOffset, replacementLength, completions, includedSuggestionSets,
+                           includedElementKinds, includedSuggestionRelevanceTags, isLast, libraryFilePathSD);
+      if (completionInfo.myCompletions.size() > 0 && completionInfo.myCompletions.get(0).getKind().equals("INVOCATION")) {
+        defaultCompletions = completionInfo;
+      }
+      else if (defaultCompletions == null) {
+        defaultCompletions = completionInfo;
+      }
+
+      if (completionId.equals(myCompletionId)) {
+        myPendingSuggestions = false;
+        lastCompletions = completionInfo;
       }
     }
 
@@ -448,41 +463,22 @@ public final class DartAnalysisServerService implements Disposable {
   }
 
   public void addCompletions(@NotNull final VirtualFile file,
-                             @NotNull final String completionId,
                              @NotNull final CompletionSuggestionConsumer consumer,
                              @NotNull final CompletionLibraryRefConsumer libraryRefConsumer) {
-    while (true) {
-      ProgressManager.checkCanceled();
+    if (lastCompletions == null) return;
+    ProgressManager.checkCanceled();
+    for (final CompletionSuggestion completion : lastCompletions.myCompletions) {
+      final int convertedReplacementOffset = getConvertedOffset(file, lastCompletions.myOriginalReplacementOffset);
+      consumer.consumeCompletionSuggestion(convertedReplacementOffset, lastCompletions.myReplacementLength, completion);
+    }
 
-      synchronized (myCompletionInfos) {
-        CompletionInfo completionInfo;
-        while ((completionInfo = myCompletionInfos.poll()) != null) {
-          if (!completionInfo.myCompletionId.equals(completionId)) continue;
-          if (!completionInfo.isLast) continue;
-
-          for (final CompletionSuggestion completion : completionInfo.myCompletions) {
-            final int convertedReplacementOffset = getConvertedOffset(file, completionInfo.myOriginalReplacementOffset);
-            consumer.consumeCompletionSuggestion(convertedReplacementOffset, completionInfo.myReplacementLength, completion);
-          }
-
-          final Set<String> includedKinds = Sets.newHashSet(completionInfo.myIncludedElementKinds);
-          final Map<String, IncludedSuggestionRelevanceTag> includedRelevanceTags = new HashMap<>();
-          for (IncludedSuggestionRelevanceTag includedRelevanceTag : completionInfo.myIncludedSuggestionRelevanceTags) {
-            includedRelevanceTags.put(includedRelevanceTag.getTag(), includedRelevanceTag);
-          }
-          for (final IncludedSuggestionSet includedSet : completionInfo.myIncludedSuggestionSets) {
-            libraryRefConsumer.consumeLibraryRef(includedSet, includedKinds, includedRelevanceTags, completionInfo.myLibraryFilePathSD);
-          }
-          return;
-        }
-
-        try {
-          myCompletionInfos.wait(CHECK_CANCELLED_PERIOD);
-        }
-        catch (InterruptedException e) {
-          return;
-        }
-      }
+    final Set<String> includedKinds = Sets.newHashSet(lastCompletions.myIncludedElementKinds);
+    final Map<String, IncludedSuggestionRelevanceTag> includedRelevanceTags = new HashMap<>();
+    for (IncludedSuggestionRelevanceTag includedRelevanceTag : lastCompletions.myIncludedSuggestionRelevanceTags) {
+      includedRelevanceTags.put(includedRelevanceTag.getTag(), includedRelevanceTag);
+    }
+    for (final IncludedSuggestionSet includedSet : lastCompletions.myIncludedSuggestionSets) {
+      libraryRefConsumer.consumeLibraryRef(includedSet, includedKinds, includedRelevanceTags, lastCompletions.myLibraryFilePathSD);
     }
   }
 
@@ -1435,38 +1431,39 @@ public final class DartAnalysisServerService implements Disposable {
     return resultRef.get();
   }
 
-  @Nullable
-  public String completion_getSuggestions(@NotNull final VirtualFile file, final int _offset) {
+  public void completion_getSuggestions(@NotNull final VirtualFile file, final int _offset, PsiElement element) {
+    int currOffsetInParent = element.getTextOffset();
+    if (currOffsetInParent != myLastOffsetInParent) {
+      lastCompletions = defaultCompletions;
+      myPendingSuggestions = false;
+      myCompletionId = null;
+      myLastOffsetInParent = currOffsetInParent;
+    }
+    if (myPendingSuggestions) return;
+    myPendingSuggestions = true;
     final AnalysisServer server = myServer;
     if (server == null) {
-      return null;
+      return;
     }
 
     final String filePath = FileUtil.toSystemDependentName(file.getPath());
-    final Ref<String> resultRef = new Ref<>();
-    final CountDownLatch latch = new CountDownLatch(1);
     final int offset = getOriginalOffset(file, _offset);
     server.completion_getSuggestions(filePath, offset, new GetSuggestionsConsumer() {
       @Override
       public void computedCompletionId(@NotNull final String completionId) {
-        resultRef.set(completionId);
-        latch.countDown();
+        if (currOffsetInParent == myLastOffsetInParent) {
+          myPendingSuggestions = false;
+          myCompletionId = completionId;
+        }
       }
 
       @Override
       public void onError(@NotNull final RequestError error) {
-        // Not a problem. Happens if a file is outside of the project, or server is just not ready yet.
-        latch.countDown();
+        if (currOffsetInParent == myLastOffsetInParent) {
+          myPendingSuggestions = false;
+        }
       }
     });
-
-    awaitForLatchCheckingCanceled(server, latch, GET_SUGGESTIONS_TIMEOUT);
-
-    if (latch.getCount() > 0) {
-      logTookTooLongMessage("completion_getSuggestions", GET_SUGGESTIONS_TIMEOUT, filePath);
-    }
-
-    return resultRef.get();
   }
 
   @Nullable

@@ -112,11 +112,9 @@ public class DartServerCompletionContributor extends CompletionContributor {
                das.updateFilesContent();
 
                final int offset = InjectedLanguageManager.getInstance(project).injectedToHost(originalFile, parameters.getOffset());
-               final String completionId = das.completion_getSuggestions(file, offset);
-               if (completionId == null) return;
-
+               das.completion_getSuggestions(file, offset, parameters.getPosition());
                final VirtualFile targetFile = file;
-               das.addCompletions(file, completionId, (replacementOffset, replacementLength, suggestion) -> {
+               das.addCompletions(file, (replacementOffset, replacementLength, suggestion) -> {
                  final CompletionResultSet updatedResultSet;
                  if (uriPrefix != null) {
                    updatedResultSet = resultSet;
@@ -310,6 +308,13 @@ public class DartServerCompletionContributor extends CompletionContributor {
 
     return null;
   }
+
+  @Override
+  public boolean invokeAutoPopup(@NotNull PsiElement position, char typeChar) {
+    final DartAnalysisServerService das = DartAnalysisServerService.getInstance(position.getProject());
+    return das.lastCompletions != null;
+  }
+
 
   @Override
   public void beforeCompletion(@NotNull final CompletionInitializationContext context) {
